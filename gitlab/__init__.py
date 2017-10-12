@@ -68,7 +68,7 @@ class Gitlab(object):
         api_version (str): Gitlab API version to use (3 or 4)
     """
 
-    def __init__(self, url, private_token=None, email=None, password=None,
+    def __init__(self, url, private_token=None, oauth_token=None, email=None, password=None,
                  ssl_verify=True, http_username=None, http_password=None,
                  timeout=None, api_version='3', session=None):
 
@@ -79,7 +79,8 @@ class Gitlab(object):
         self.timeout = timeout
         #: Headers that will be used in request to GitLab
         self.headers = {}
-        self._set_token(private_token)
+        self._set_token(private_token, oauth_token)
+        # self._set_oauth_token(oauth_token)
         #: The user email
         self.email = email
         #: The user password (associated with email)
@@ -180,6 +181,8 @@ class Gitlab(object):
         """
         if self.private_token:
             self._token_auth()
+        elif self.oauth_token:
+            self._oauth_token_auth()
         else:
             self._credentials_auth()
 
@@ -213,6 +216,12 @@ class Gitlab(object):
         self._token_auth()
 
     def _token_auth(self):
+        if self.api_version == '3':
+            self.user = self._objects.CurrentUser(self)
+        else:
+            self.user = self._objects.CurrentUserManager(self).get()
+
+    def _oauth_token_auth(self):
         if self.api_version == '3':
             self.user = self._objects.CurrentUser(self)
         else:
@@ -287,12 +296,41 @@ class Gitlab(object):
                       DeprecationWarning)
         self._set_token(token)
 
-    def _set_token(self, token):
+    def _set_token(self, token, oauth_token):
+        """
+        Sets the private token for authentication.
+        Only one of ``token`` and ``oauth_token`` should be provided.
+        Raises:
+            GitlabAuthenticationError: When both ``token`` and ``oauth_token``
+                are provided.
+        Args:
+            token (str): A private token.
+            oauth_token (str): An oauth token.
+        """
+
         self.private_token = token if token else None
-        if token:
+        self.oauth_token = oauth_token if oauth_token else None
+
+        if token is not None and oauth_token is not None:
+            raise GitlabAuthenticationError("Private and OAuth token both "
+                                            "provided: define only one")
+
+        if oauth_token:
+            self.headers.pop('PRIVATE-TOKEN', None)
+            self.headers['Authorization'] = 'Bearer {}'.format(oauth_token)
+        elif token:
+            self.headers.pop('PRIVATE-TOKEN', None)
             self.headers["PRIVATE-TOKEN"] = token
-        elif "PRIVATE-TOKEN" in self.headers:
-            del self.headers["PRIVATE-TOKEN"]
+        else:
+            self.headers.pop('PRIVATE-TOKEN', None)
+            self.headers.pop('Authorization', None)
+
+    def _set_oauth_token(self, oauth_token):
+        self.oauth_token = oauth_token if oauth_token else None
+        if oauth_token:
+            self.headers["ACCESS-TOKEN"] = oauth_token
+        elif "ACCESS-TOKEN" in self.headers:
+            del self.headers["ACCESS-TOKEN"]
 
     def set_credentials(self, email, password):
         """Sets the email/login and password for authentication.
@@ -347,10 +385,24 @@ class Gitlab(object):
         else:
             url = '%s%s' % (self._url, path_)
 
+        headers = self._create_headers(content_type)
+        auth = requests.auth.HTTPBasicAuth(
+            self.http_username,
+            self.http_password
+            )
+        if headers['Authorization']:
+            auth = None
+
         opts = self._get_session_opts(content_type)
         try:
-            return self.session.get(url, params=kwargs, stream=streamed,
-                                    **opts)
+            return self.session.get(url,
+                params=kwargs,
+                headers=headers,
+                verify=self.ssl_verify,
+                timeout=self.timeout,
+                stream=streamed,
+                auth=auth)
+
         except Exception as e:
             raise GitlabConnectionError(
                 "Can't connect to GitLab server (%s)" % e)
